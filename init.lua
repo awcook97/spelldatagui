@@ -24,7 +24,9 @@
 ---@type Mq
 local mq = require('mq')
 local ImGui = require('ImGui')
-local _SPAs = require('_SPAs')
+local hasSPAs, spaModule = pcall(require, '_SPAs')
+---@type spadata|nil
+local _SPAs = hasSPAs and spaModule or nil
 
 local SCRIPT_NAME      = 'spelldatagui'
 local WINDOW_TITLE     = 'Spell Data Inspector'
@@ -41,8 +43,11 @@ local COLOR_BAD     = { 1.00, 0.40, 0.40, 1.00 }  -- status line errors
 local COLOR_OK      = { 0.60, 0.95, 0.60, 1.00 }
 local COLOR_HEADING = { 0.40, 0.85, 1.00, 1.00 }
 
-local SPA_NOSPELL        = _SPAs.EQSPA.SPA_NOSPELL
-local SPA_CHA            = _SPAs.EQSPA.SPA_CHA
+local SPA_NOSPELL, SPA_CHA = 254, 10
+if _SPAs then
+    SPA_NOSPELL, SPA_CHA = _SPAs.EQSPA.SPA_NOSPELL, _SPAs.EQSPA.SPA_CHA
+end
+local SNAPSHOT_YIELD_EVERY = 25
 local SLOT_VALUE_MEMBERS = { 'Base', 'Base2', 'Max', 'Calc' }
 local SPA_SLOT_MEMBERS   = { HasSPA = true, Attrib = true, Base = true, Base2 = true, Max = true, Calc = true }
 
@@ -63,6 +68,7 @@ local SPA_SLOT_MEMBERS   = { HasSPA = true, Attrib = true, Base = true, Base2 = 
 ---@field copy string
 ---@field tooltip string
 ---@field slotLines string[]|nil
+---@field tloParam integer|nil
 
 -- Optional bindings -- guard so the script still runs on older MQ builds.
 local hasGetType   = type(mq.gettype) == 'function'
@@ -77,9 +83,12 @@ local openGUI, shouldDrawGUI = true, true
 -- Member list cache (built once at startup, rebuildable via the Rescan button)
 local membersByIndex = {}   -- { { index = n, name = 'Base' }, ... } sorted by index
 local memberScanError = nil
+---@type table<string, string>
+local typeByMember = {}
 
 -- Current lookup
 local spellInput   = ''     -- raw text in the InputText
+---@type integer|nil
 local spellKey     = nil    -- what we actually pass to mq.TLO.Spell(...)
 local spellName    = nil
 local spellID      = nil
@@ -187,11 +196,11 @@ local function scanMembers()
         end
     end
 
-    table.sort(found, function(a, b) return a.index < b.index end)
     membersByIndex = found
+    typeByMember = {}
 
     if #found == 0 then
-        memberScanError = 'No members returned from Type[spell] -- are you in game?'
+        memberScanError = 'No members returned from Type[spell] -- the member lookup failed.'
     end
     printf('\ag[%s]\ax enumerated \ay%d\ax members of the spell datatype', SCRIPT_NAME, #found)
 end
@@ -208,8 +217,9 @@ local function readSpellName(key)
     return mq.TLO.Spell(key).Name()
 end
 
---- Try the input as a name, and (if it's all digits) as an ID too.
---- Returns the key that resolved plus the spell ID, or nil.
+--- Resolve the input as a spell name, or (if it's all digits) as an ID too.
+---@param input string
+---@return integer|nil spellID
 local function resolveSpell(input)
     local text = trim(input)
     if text == '' then return nil end
@@ -223,7 +233,7 @@ local function resolveSpell(input)
     for _, key in ipairs(candidates) do
         local ok, id = pcall(readSpellID, key)
         if ok and id and id ~= 0 then
-            return key, id
+            return id
         end
     end
     return nil
@@ -271,7 +281,7 @@ local function readSpellEffects(key)
     for slot = 1, numEffects do
         local okSpa, spa = pcall(readSlotValue, key, 'Attrib', slot)
         if okSpa and type(spa) == 'number' and not isEmptySlot(key, slot, spa) then
-            local effect = { slot = slot, spa = spa, spaName = _SPAs.SPAName(spa) or 'unknown SPA', values = {} }
+            local effect = { slot = slot, spa = spa, spaName = _SPAs and _SPAs.SPAName(spa) or ('SPA ' .. spa), values = {} }
             for _, memberName in ipairs(SLOT_VALUE_MEMBERS) do
                 local okValue, value = pcall(readSlotValue, key, memberName, slot)
                 effect.values[memberName] = okValue and (formatValue(value)) or '?'
@@ -308,12 +318,25 @@ local function slotMemberLines(memberName, effects)
     return lines, summary
 end
 
+--- MQ datatype name for a member, cached per member name once resolved.
+---@param memberName string
+---@return string|nil
+local function memberType(memberName)
+    local cached = typeByMember[memberName]
+    if cached or not hasGetType then return cached end
+    local okType, mqType = pcall(readMemberType, spellKey, memberName)
+    if okType and type(mqType) == 'string' and trim(mqType) ~= '' then
+        typeByMember[memberName] = mqType
+        return mqType
+    end
+    return nil
+end
+
 --- Read one member of the current spell into a fresh display row.
 ---@param member SpellMember
 ---@param effects SpellEffectSlot[]
----@param knownType string|nil MQ type already resolved for this member; skips mq.gettype
 ---@return SpellRow
-local function buildRow(member, effects, knownType)
+local function buildRow(member, effects)
     local row = { index = member.index, name = member.name }
 
     if SPA_SLOT_MEMBERS[member.name] and #effects > 0 then
@@ -321,6 +344,7 @@ local function buildRow(member, effects, knownType)
         row.state     = 'value'
         row.vtype     = member.name == 'HasSPA' and 'SPA list' or 'per slot'
         row.slotLines = lines
+        row.tloParam  = member.name == 'HasSPA' and effects[1].spa or effects[1].slot
         row.copy      = table.concat(lines, '\n')
         row.display   = truncate(table.concat(summary, ', '))
         row.tooltip   = string.format('%s  [%s]\n\n%s', member.name, row.vtype, row.copy)
@@ -340,15 +364,7 @@ local function buildRow(member, effects, knownType)
 
     local text, luaType = formatValue(value)
     row.state = (value == nil) and 'null' or 'value'
-    row.vtype = knownType or luaType
-
-    if not knownType and hasGetType then
-        local okType, mqType = pcall(readMemberType, spellKey, member.name)
-        if okType and type(mqType) == 'string' and trim(mqType) ~= '' then
-            row.vtype = mqType
-        end
-    end
-
+    row.vtype = memberType(member.name) or luaType
     row.copy    = text
     row.display = truncate(text)
     row.tooltip = string.format('%s  [%s]\n\n%s', member.name, row.vtype, text)
@@ -366,6 +382,7 @@ local function applyRowChanges(row, fresh)
     row.copy      = fresh.copy
     row.tooltip   = fresh.tooltip
     row.slotLines = fresh.slotLines
+    row.tloParam  = fresh.tloParam
 end
 
 --- Recompute the value / null / error counts from the current rows.
@@ -382,33 +399,46 @@ local function countRows()
     end
 end
 
+--- Read a fresh row for every member, yielding a frame every SNAPSHOT_YIELD_EVERY members.
+---@param key integer
+---@param members SpellMember[]
+---@return SpellRow[]
+local function readRows(key, members)
+    local effects = readSpellEffects(key)
+    local rows = {}
+    for i, member in ipairs(members) do
+        rows[i] = buildRow(member, effects)
+        if i % SNAPSHOT_YIELD_EVERY == 0 then mq.delay(0) end
+    end
+    return rows
+end
+
 local function buildSnapshot()
-    rowsByIndex, rowsByName = {}, {}
     lastRefresh = mq.gettime()
 
-    if not spellKey then
+    local key = spellKey
+    if not key then
+        rowsByIndex, rowsByName = {}, {}
         countRows()
         return
     end
 
-    local effects = readSpellEffects(spellKey)
-
-    for _, member in ipairs(membersByIndex) do
-        local row = buildRow(member, effects)
-        rowsByIndex[#rowsByIndex + 1] = row
-        rowsByName[#rowsByName + 1]   = row
-    end
-    countRows()
+    local newByIndex = readRows(key, membersByIndex)
+    local newByName = {}
+    for i, row in ipairs(newByIndex) do newByName[i] = row end
 
     -- Same row tables, alternate ordering. Index is the stable tiebreak.
-    table.sort(rowsByName, function(a, b)
+    table.sort(newByName, function(a, b)
         local an, bn = a.name:lower(), b.name:lower()
         if an == bn then return a.index < b.index end
         return an < bn
     end)
+
+    rowsByIndex, rowsByName = newByIndex, newByName
+    countRows()
 end
 
---- Re-read the current spell's values in place, updating only rows whose value changed.
+--- Re-read the current spell's values, then update only rows whose value changed.
 local function refreshSnapshot()
     if #rowsByIndex == 0 then
         buildSnapshot()
@@ -416,12 +446,12 @@ local function refreshSnapshot()
     end
 
     lastRefresh = mq.gettime()
-    if not spellKey then return end
+    local key = spellKey
+    if not key then return end
 
-    local effects = readSpellEffects(spellKey)
-    for _, row in ipairs(rowsByIndex) do
-        local knownType = row.state ~= 'error' and row.vtype or nil
-        applyRowChanges(row, buildRow(row, effects, knownType))
+    local fresh = readRows(key, rowsByIndex)
+    for i, row in ipairs(rowsByIndex) do
+        applyRowChanges(row, fresh[i])
     end
     countRows()
 end
@@ -440,17 +470,17 @@ local function doLookup()
         return
     end
 
-    local key, id = resolveSpell(text)
-    if not key then
+    local id = resolveSpell(text)
+    if not id then
         clearResults()
         statusText    = string.format('No spell found for "%s"', text)
         statusIsError = true
         return
     end
 
-    spellKey = key
+    spellKey = id
     spellID  = id
-    local okName, name = pcall(readSpellName, key)
+    local okName, name = pcall(readSpellName, id)
     spellName = (okName and name) or text
 
     statusText    = string.format('%s (ID %d)', tostring(spellName), tonumber(spellID) or 0)
@@ -487,14 +517,14 @@ end
 local function drawToolbar()
     -- Spell input --------------------------------------------------------
     ImGui.SetNextItemWidth(260)
-    local newInput, inputChanged = ImGui.InputText('Spell name or ID', spellInput)
-    if inputChanged then
+    local newInput, enterPressed = ImGui.InputText('Spell name or ID', spellInput, ImGuiInputTextFlags.EnterReturnsTrue)
+    if newInput ~= spellInput then
         spellInput = newInput
         lookupDueAt = mq.gettime() + LOOKUP_DEBOUNCE
     end
 
     ImGui.SameLine()
-    if ImGui.Button('Look up') then
+    if ImGui.Button('Look up') or enterPressed then
         lookupDueAt = nil
         pendingLookup = true
     end
@@ -563,7 +593,9 @@ local function drawRow(row)
     -- TextUnformatted, not Text: ImGui.Text treats arg 1 as a format string and
     -- spell values (e.g. "Increase Hitpoints by 100%") contain % signs.
     if row.slotLines then
-        if ImGui.TreeNode(row.display .. '##slots') then
+        local open = ImGui.TreeNode(row.display .. '###slots')
+        if ImGui.IsItemHovered() then ImGui.SetTooltip('%s', row.tooltip) end
+        if open then
             for _, line in ipairs(row.slotLines) do
                 ImGui.TextUnformatted(line)
             end
@@ -571,9 +603,9 @@ local function drawRow(row)
         end
     else
         ImGui.TextUnformatted(row.display)
+        if ImGui.IsItemHovered() then ImGui.SetTooltip('%s', row.tooltip) end
     end
     ImGui.PopStyleColor()
-    if ImGui.IsItemHovered() then ImGui.SetTooltip('%s', row.tooltip) end
 
     ImGui.TableNextColumn()
     if hasClipboard then
@@ -589,7 +621,11 @@ local function drawRow(row)
                 copyToClipboard(string.format('%s = %s', row.name, row.copy))
             end
             if ImGui.MenuItem('Copy TLO expression') then
-                copyToClipboard(string.format('mq.TLO.Spell(%q).%s()', tostring(spellName), row.name))
+                if row.tloParam then
+                    copyToClipboard(string.format('mq.TLO.Spell(%d).%s(%d)()', spellID, row.name, row.tloParam))
+                else
+                    copyToClipboard(string.format('mq.TLO.Spell(%d).%s()', spellID, row.name))
+                end
             end
             ImGui.EndPopup()
         end
