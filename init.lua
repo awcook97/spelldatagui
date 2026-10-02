@@ -24,6 +24,7 @@
 ---@type Mq
 local mq = require('mq')
 local ImGui = require('ImGui')
+local _SPAs = require('_SPAs')
 
 local SCRIPT_NAME      = 'displayspelldata'
 local WINDOW_TITLE     = 'Spell Data Inspector'
@@ -39,6 +40,16 @@ local COLOR_ERROR   = { 0.55, 0.55, 0.55, 1.00 }  -- threw / needs a param
 local COLOR_BAD     = { 1.00, 0.40, 0.40, 1.00 }  -- status line errors
 local COLOR_OK      = { 0.60, 0.95, 0.60, 1.00 }
 local COLOR_HEADING = { 0.40, 0.85, 1.00, 1.00 }
+
+local SPA_NOSPELL        = _SPAs.EQSPA.SPA_NOSPELL
+local SLOT_VALUE_MEMBERS = { 'Base', 'Base2', 'Max', 'Calc' }
+local SPA_SLOT_MEMBERS   = { HasSPA = true, Attrib = true, Base = true, Base2 = true, Max = true, Calc = true }
+
+---@class SpellEffectSlot
+---@field slot integer
+---@field spa integer
+---@field spaName string
+---@field values table<string, string>
 
 -- Optional bindings -- guard so the script still runs on older MQ builds.
 local hasGetType   = type(mq.gettype) == 'function'
@@ -219,6 +230,59 @@ local function readMemberType(key, memberName)
     return mq.gettype(mq.TLO.Spell(key)[memberName])
 end
 
+--- Read a slot-indexed member such as Attrib(slot).
+local function readSlotValue(key, memberName, slot)
+    return mq.TLO.Spell(key)[memberName](slot)()
+end
+
+--- Read every effect slot on the spell: its SPA plus Base/Base2/Max/Calc.
+---@param key string|integer
+---@return SpellEffectSlot[]
+local function readSpellEffects(key)
+    local effects = {}
+    local okCount, numEffects = pcall(readMemberValue, key, 'NumEffects')
+    if not okCount or type(numEffects) ~= 'number' then return effects end
+
+    for slot = 1, numEffects do
+        local okSpa, spa = pcall(readSlotValue, key, 'Attrib', slot)
+        if okSpa and type(spa) == 'number' and spa ~= SPA_NOSPELL then
+            local effect = { slot = slot, spa = spa, spaName = _SPAs.SPAName(spa) or 'unknown SPA', values = {} }
+            for _, memberName in ipairs(SLOT_VALUE_MEMBERS) do
+                local okValue, value = pcall(readSlotValue, key, memberName, slot)
+                effect.values[memberName] = okValue and (formatValue(value)) or '?'
+            end
+            effects[#effects + 1] = effect
+        end
+    end
+    return effects
+end
+
+--- Detail lines and short summary values for an SPA-related member across the spell's effect slots.
+---@param memberName string
+---@param effects SpellEffectSlot[]
+---@return string[] lines
+---@return string[] summary
+local function slotMemberLines(memberName, effects)
+    local lines, summary, seen = {}, {}, {}
+    for _, effect in ipairs(effects) do
+        if memberName == 'HasSPA' then
+            if not seen[effect.spa] then
+                seen[effect.spa] = true
+                lines[#lines + 1] = string.format('%s (%d)', effect.spaName, effect.spa)
+                summary[#summary + 1] = effect.spaName
+            end
+        elseif memberName == 'Attrib' then
+            lines[#lines + 1] = string.format('slot %d: %s (%d)', effect.slot, effect.spaName, effect.spa)
+            summary[#summary + 1] = tostring(effect.spa)
+        else
+            local value = effect.values[memberName]
+            lines[#lines + 1] = string.format('slot %d: %s  [%s]', effect.slot, value, effect.spaName)
+            summary[#summary + 1] = value
+        end
+    end
+    return lines, summary
+end
+
 local function buildSnapshot()
     rowsByIndex, rowsByName = {}, {}
     countOK, countNull, countErr = 0, 0, 0
@@ -226,35 +290,48 @@ local function buildSnapshot()
 
     if not spellKey then return end
 
+    local effects = readSpellEffects(spellKey)
+
     for _, member in ipairs(membersByIndex) do
         local row = { index = member.index, name = member.name }
 
-        local ok, value = pcall(readMemberValue, spellKey, member.name)
-        if not ok then
-            local msg = cleanError(value)
-            row.state   = 'error'
-            row.vtype   = '--'
-            row.display = isParamError(msg) and '<requires param>' or ('<error> ' .. truncate(msg))
-            row.copy    = msg
-            row.tooltip = string.format('%s\n\n%s', member.name, msg)
-            countErr = countErr + 1
+        if SPA_SLOT_MEMBERS[member.name] and #effects > 0 then
+            local lines, summary = slotMemberLines(member.name, effects)
+            row.state     = 'value'
+            row.vtype     = member.name == 'HasSPA' and 'SPA list' or 'per slot'
+            row.slotLines = lines
+            row.copy      = table.concat(lines, '\n')
+            row.display   = truncate(table.concat(summary, ', '))
+            row.tooltip   = string.format('%s  [%s]\n\n%s', member.name, row.vtype, row.copy)
+            countOK = countOK + 1
         else
-            local text, luaType = formatValue(value)
-            row.state = (value == nil) and 'null' or 'value'
-            row.vtype = luaType
+            local ok, value = pcall(readMemberValue, spellKey, member.name)
+            if not ok then
+                local msg = cleanError(value)
+                row.state   = 'error'
+                row.vtype   = '--'
+                row.display = isParamError(msg) and '<requires param>' or ('<error> ' .. truncate(msg))
+                row.copy    = msg
+                row.tooltip = string.format('%s\n\n%s', member.name, msg)
+                countErr = countErr + 1
+            else
+                local text, luaType = formatValue(value)
+                row.state = (value == nil) and 'null' or 'value'
+                row.vtype = luaType
 
-            if hasGetType then
-                local okType, mqType = pcall(readMemberType, spellKey, member.name)
-                if okType and type(mqType) == 'string' and trim(mqType) ~= '' then
-                    row.vtype = mqType
+                if hasGetType then
+                    local okType, mqType = pcall(readMemberType, spellKey, member.name)
+                    if okType and type(mqType) == 'string' and trim(mqType) ~= '' then
+                        row.vtype = mqType
+                    end
                 end
+
+                row.copy    = text
+                row.display = truncate(text)
+                row.tooltip = string.format('%s  [%s]\n\n%s', member.name, row.vtype, text)
+
+                if row.state == 'null' then countNull = countNull + 1 else countOK = countOK + 1 end
             end
-
-            row.copy    = text
-            row.display = truncate(text)
-            row.tooltip = string.format('%s  [%s]\n\n%s', member.name, row.vtype, text)
-
-            if row.state == 'null' then countNull = countNull + 1 else countOK = countOK + 1 end
         end
 
         rowsByIndex[#rowsByIndex + 1] = row
@@ -405,7 +482,16 @@ local function drawRow(row)
     pushStateColor(row.state)
     -- TextUnformatted, not Text: ImGui.Text treats arg 1 as a format string and
     -- spell values (e.g. "Increase Hitpoints by 100%") contain % signs.
-    ImGui.TextUnformatted(row.display)
+    if row.slotLines then
+        if ImGui.TreeNode(row.display .. '##slots') then
+            for _, line in ipairs(row.slotLines) do
+                ImGui.TextUnformatted(line)
+            end
+            ImGui.TreePop()
+        end
+    else
+        ImGui.TextUnformatted(row.display)
+    end
     ImGui.PopStyleColor()
     if ImGui.IsItemHovered() then ImGui.SetTooltip('%s', row.tooltip) end
 
