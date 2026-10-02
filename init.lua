@@ -42,6 +42,7 @@ local COLOR_OK      = { 0.60, 0.95, 0.60, 1.00 }
 local COLOR_HEADING = { 0.40, 0.85, 1.00, 1.00 }
 
 local SPA_NOSPELL        = _SPAs.EQSPA.SPA_NOSPELL
+local SPA_CHA            = _SPAs.EQSPA.SPA_CHA
 local SLOT_VALUE_MEMBERS = { 'Base', 'Base2', 'Max', 'Calc' }
 local SPA_SLOT_MEMBERS   = { HasSPA = true, Attrib = true, Base = true, Base2 = true, Max = true, Calc = true }
 
@@ -235,7 +236,19 @@ local function readSlotValue(key, memberName, slot)
     return mq.TLO.Spell(key)[memberName](slot)()
 end
 
---- Read every effect slot on the spell: its SPA plus Base/Base2/Max/Calc.
+--- True when the slot holds no effect: SPA_NOSPELL, or the SPA_CHA filler with a base of 0.
+---@param key string|integer
+---@param slot integer
+---@param spa integer
+---@return boolean
+local function isEmptySlot(key, slot, spa)
+    if spa == SPA_NOSPELL then return true end
+    if spa ~= SPA_CHA then return false end
+    local okBase, base = pcall(readSlotValue, key, 'Base', slot)
+    return okBase and base == 0
+end
+
+--- Read every non-empty effect slot on the spell: its SPA plus Base/Base2/Max/Calc.
 ---@param key string|integer
 ---@return SpellEffectSlot[]
 local function readSpellEffects(key)
@@ -245,7 +258,7 @@ local function readSpellEffects(key)
 
     for slot = 1, numEffects do
         local okSpa, spa = pcall(readSlotValue, key, 'Attrib', slot)
-        if okSpa and type(spa) == 'number' and spa ~= SPA_NOSPELL then
+        if okSpa and type(spa) == 'number' and not isEmptySlot(key, slot, spa) then
             local effect = { slot = slot, spa = spa, spaName = _SPAs.SPAName(spa) or 'unknown SPA', values = {} }
             for _, memberName in ipairs(SLOT_VALUE_MEMBERS) do
                 local okValue, value = pcall(readSlotValue, key, memberName, slot)
