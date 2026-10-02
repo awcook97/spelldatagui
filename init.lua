@@ -522,7 +522,7 @@ local function drawRow(row)
                 copyToClipboard(string.format('%s = %s', row.name, row.copy))
             end
             if ImGui.MenuItem('Copy TLO expression') then
-                copyToClipboard(string.format("mq.TLO.Spell('%s').%s()", tostring(spellName), row.name))
+                copyToClipboard(string.format('mq.TLO.Spell(%q).%s()', tostring(spellName), row.name))
             end
             ImGui.EndPopup()
         end
