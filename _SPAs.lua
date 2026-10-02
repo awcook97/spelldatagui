@@ -1,11 +1,7 @@
----============================================================================
---- Spell Cache
----============================================================================
-
 --- EQ Spell "Affect"
 --- http:---everquest.fanra.info/wiki/SPA_list
 ---@enum _EQSPA
-EQSPA =
+local EQSPA =
 {
 	SPA_HP                                  = 0,
 	SPA_AC                                  = 1,
@@ -537,7 +533,7 @@ EQSPA =
 }
 
 ---@enum _EQSPELLCAT
-EQSPELLCAT =
+local EQSPELLCAT =
 {
 	SPELLCAT_AEGOLISM = 1,
 	SPELLCAT_AGILITY = 2,
@@ -719,7 +715,7 @@ EQSPELLCAT =
 
 
 ---@enum _EQResistType
-EQResistType =
+local EQResistType =
 {
 	ResistType_None = 0,
 	ResistType_Magic = 1,
@@ -734,7 +730,7 @@ EQResistType =
 }
 
 ---@enum _EQSpellType
-EQSpellType =
+local EQSpellType =
 {
 	SpellType_Detrimental = 0,
 	SpellType_Beneficial = 1,
@@ -744,7 +740,7 @@ EQSpellType =
 --- Determines the algorithm used to affect the spell value, potentially affected by
 --- time or by level or other things too...
 ---@enum _EQSpellValueRangeCalc
-EQSpellValueRangeCalc =
+local EQSpellValueRangeCalc =
 {
 	SpellValueRangeCalc_DecayTick1 = 107,
 	SpellValueRangeCalc_DecayTick2 = 108,
@@ -754,7 +750,7 @@ EQSpellValueRangeCalc =
 }
 
 ---@enum _EQSpellTargetType
-EQSpellTargetType =
+local EQSpellTargetType =
 {
 	TargetType_None = 0,
 	TargetType_LineOfSight = 1,

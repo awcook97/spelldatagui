@@ -1,5 +1,5 @@
 --[[
-    display-spell-data.lua - ImGui inspector for the MacroQuest `spell` datatype.
+    spelldatagui - ImGui inspector for the MacroQuest `spell` datatype.
 
     This is the GUI version of the one-liner:
         /lua parse for i=1,255 do printf("%d %s", i, mq.TLO.Type("spell").Member(i)()) end
@@ -26,7 +26,7 @@ local mq = require('mq')
 local ImGui = require('ImGui')
 local _SPAs = require('_SPAs')
 
-local SCRIPT_NAME      = 'displayspelldata'
+local SCRIPT_NAME      = 'spelldatagui'
 local WINDOW_TITLE     = 'Spell Data Inspector'
 local MAX_MEMBER_INDEX = 255   -- Type[spell].Member[N] is 1..N, sparse
 local LOOKUP_DEBOUNCE  = 300   -- ms to wait after typing before re-reading
