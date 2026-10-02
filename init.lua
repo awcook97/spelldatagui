@@ -153,7 +153,7 @@ local function scanMembers()
     for i = 1, MAX_MEMBER_INDEX do
         local name = mq.TLO.Type('spell').Member(i)()
         -- Sparse index space: nils/blanks are holes, keep walking to MAX_MEMBER_INDEX.
-        if type(name) == 'string' then
+        if name then
             name = trim(name)
             if name ~= '' and name ~= 'NULL' then
                 found[#found + 1] = { index = i, name = name }
@@ -213,11 +213,11 @@ end
 local function readSpellEffects(key)
     local effects = {}
     local numEffects = mq.TLO.Spell(key).NumEffects()
-    if type(numEffects) ~= 'number' then return effects end
+    if not numEffects then return effects end
 
     for slot = 1, numEffects do
         local spa = mq.TLO.Spell(key).Attrib(slot)()
-        if type(spa) == 'number' and not isEmptySlot(key, slot, spa) then
+        if spa and not isEmptySlot(key, slot, spa) then
             local effect = { slot = slot, spa = spa, spaName = _SPAs.SPAName(spa), values = {} }
             for _, memberName in ipairs(SLOT_VALUE_MEMBERS) do
                 effect.values[memberName] = formatValue(mq.TLO.Spell(key)[memberName](slot)())
@@ -261,7 +261,7 @@ local function memberType(memberName)
     local cached = typeByMember[memberName]
     if cached then return cached end
     local mqType = mq.gettype(mq.TLO.Spell(spellKey)[memberName])
-    if type(mqType) == 'string' and trim(mqType) ~= '' then
+    if mqType and trim(mqType) ~= '' then
         typeByMember[memberName] = mqType
         return mqType
     end
