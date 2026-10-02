@@ -6,47 +6,27 @@
 
     Type a spell name (or a spell ID) and the window lists every member the `spell`
     datatype exposes, along with that spell's value for each member.
-
-    ---------------------------------------------------------------------------
-    NOTES
-    ---------------------------------------------------------------------------
-    * Type[spell].Member[N] is documented as "not all values will be used", so the
-      index space is sparse -- we skip holes rather than stopping at the first nil.
-    * Plenty of spell members require an index/param: Base(n), Attrib(n), Trigger(n),
-      StacksWith(...), etc. Reading those bare raises a Lua error out of the MQ
-      binding, so EVERY read here is pcall-wrapped and failures render dimmed as
-      <requires param> with the real error in the tooltip.
-    * All TLO reads happen in the main loop, never inside the ImGui draw callback.
-      A full snapshot is ~2 evaluations x ~150 members; doing that every frame would
-      stutter the client.
 ]]
 
 ---@type Mq
 local mq = require('mq')
 local ImGui = require('ImGui')
-local hasSPAs, spaModule = pcall(require, '_SPAs')
----@type spadata|nil
-local _SPAs = hasSPAs and spaModule or nil
+---@type spadata
+local _SPAs = require('_SPAs')
 
 local SCRIPT_NAME      = 'spelldatagui'
 local WINDOW_TITLE     = 'Spell Data Inspector'
-local MAX_MEMBER_INDEX = 255   -- Type[spell].Member[N] is 1..N, sparse
-local LOOKUP_DEBOUNCE  = 300   -- ms to wait after typing before re-reading
-local AUTO_REFRESH_MS  = 1000  -- how often auto-refresh re-snapshots values
-local MAX_DISPLAY_LEN  = 200   -- truncate long values in the table (tooltip has all)
-
--- Colors (r, g, b, a)
-local COLOR_VALUE   = { 0.60, 0.95, 0.60, 1.00 }  -- real value
-local COLOR_NULL    = { 0.50, 0.62, 0.82, 1.00 }  -- member resolved but was NULL
-local COLOR_ERROR   = { 0.55, 0.55, 0.55, 1.00 }  -- threw / needs a param
-local COLOR_BAD     = { 1.00, 0.40, 0.40, 1.00 }  -- status line errors
+local MAX_MEMBER_INDEX = 255
+local LOOKUP_DEBOUNCE  = 300
+local AUTO_REFRESH_MS  = 1000
+local MAX_DISPLAY_LEN  = 200
+local COLOR_VALUE   = { 0.60, 0.95, 0.60, 1.00 }
+local COLOR_NULL    = { 0.50, 0.62, 0.82, 1.00 }
+local COLOR_ERROR   = { 0.55, 0.55, 0.55, 1.00 }
+local COLOR_BAD     = { 1.00, 0.40, 0.40, 1.00 }
 local COLOR_OK      = { 0.60, 0.95, 0.60, 1.00 }
 local COLOR_HEADING = { 0.40, 0.85, 1.00, 1.00 }
 
-local SPA_NOSPELL, SPA_CHA = 254, 10
-if _SPAs then
-    SPA_NOSPELL, SPA_CHA = _SPAs.EQSPA.SPA_NOSPELL, _SPAs.EQSPA.SPA_CHA
-end
 local SNAPSHOT_YIELD_EVERY = 25
 local SLOT_VALUE_MEMBERS = { 'Base', 'Base2', 'Max', 'Calc' }
 local SPA_SLOT_MEMBERS   = { HasSPA = true, Attrib = true, Base = true, Base2 = true, Max = true, Calc = true }
@@ -54,7 +34,7 @@ local SPA_SLOT_MEMBERS   = { HasSPA = true, Attrib = true, Base = true, Base2 = 
 ---@class SpellEffectSlot
 ---@field slot integer
 ---@field spa integer
----@field spaName string
+---@field spaName string|nil
 ---@field values table<string, string>
 
 ---@class SpellMember
@@ -70,10 +50,6 @@ local SPA_SLOT_MEMBERS   = { HasSPA = true, Attrib = true, Base = true, Base2 = 
 ---@field slotLines string[]|nil
 ---@field tloParam integer|nil
 
--- Optional bindings -- guard so the script still runs on older MQ builds.
-local hasGetType   = type(mq.gettype) == 'function'
-local hasClipboard = type(ImGui.SetClipboardText) == 'function'
-
 -- ---------------------------------------------------------------------------
 -- State
 -- ---------------------------------------------------------------------------
@@ -87,17 +63,16 @@ local memberScanError = nil
 local typeByMember = {}
 
 -- Current lookup
-local spellInput   = ''     -- raw text in the InputText
----@type integer|nil
-local spellKey     = nil    -- what we actually pass to mq.TLO.Spell(...)
+local spellInput   = ''
+local spellKey     = 0      -- what we pass to mq.TLO.Spell(...); 0 = no spell loaded
 local spellName    = nil
 local spellID      = nil
 local statusText   = 'Enter a spell name or ID.'
 local statusIsError = false
 
 -- Value snapshot (rebuilt on lookup / refresh)
-local rowsByIndex  = {}     -- ordered by member index
-local rowsByName   = {}     -- same row tables, ordered alphabetically
+local rowsByIndex  = {}
+local rowsByName   = {}
 local countOK, countNull, countErr = 0, 0, 0
 local lastRefresh  = 0
 
@@ -106,7 +81,6 @@ local memberFilter = ''
 local sortAlpha    = false
 local autoRefresh  = false
 
--- Work requests from the draw callback -> main loop
 local pendingRescan  = false
 local pendingLookup  = false
 local pendingRefresh = false
@@ -154,9 +128,7 @@ local function formatValue(v)
     elseif t == 'boolean' then
         return tostring(v), 'boolean'
     end
-    -- userdata / table / function: tostring can itself throw on MQ userdata
-    local ok, s = pcall(tostring, v)
-    return (ok and s or ('<un-tostring-able ' .. t .. '>')), t
+    return tostring(v), t
 end
 
 local function truncate(s)
@@ -167,28 +139,21 @@ local function truncate(s)
 end
 
 local function copyToClipboard(text)
-    if hasClipboard then
-        ImGui.SetClipboardText(tostring(text))
-    end
+    ImGui.SetClipboardText(tostring(text))
 end
 
 -- ---------------------------------------------------------------------------
 -- Member enumeration (the /lua parse one-liner, cached)
 -- ---------------------------------------------------------------------------
 
---- Pulled out so pcall doesn't need a fresh closure per iteration.
-local function readMemberName(i)
-    return mq.TLO.Type('spell').Member(i)()
-end
-
 local function scanMembers()
     local found = {}
     memberScanError = nil
 
     for i = 1, MAX_MEMBER_INDEX do
-        local ok, name = pcall(readMemberName, i)
+        local name = mq.TLO.Type('spell').Member(i)()
         -- Sparse index space: nils/blanks are holes, keep walking to MAX_MEMBER_INDEX.
-        if ok and type(name) == 'string' then
+        if type(name) == 'string' then
             name = trim(name)
             if name ~= '' and name ~= 'NULL' then
                 found[#found + 1] = { index = i, name = name }
@@ -209,14 +174,6 @@ end
 -- Spell resolution + value snapshot
 -- ---------------------------------------------------------------------------
 
-local function readSpellID(key)
-    return mq.TLO.Spell(key).ID()
-end
-
-local function readSpellName(key)
-    return mq.TLO.Spell(key).Name()
-end
-
 --- Resolve the input as a spell name, or (if it's all digits) as an ID too.
 ---@param input string
 ---@return integer|nil spellID
@@ -231,31 +188,12 @@ local function resolveSpell(input)
     end
 
     for _, key in ipairs(candidates) do
-        local ok, id = pcall(readSpellID, key)
-        if ok and id and id ~= 0 then
+        local id = mq.TLO.Spell(key).ID()
+        if id and id ~= 0 then
             return id
         end
     end
     return nil
-end
-
---- Read one member off the spell. Separate function so pcall gets a plain call.
---- NOTE: spell[memberName] is the dynamic form of spell.MemberName -- in Lua both
---- go through the same __index metamethod on the MQ typevar userdata.
-local function readMemberValue(key, memberName)
-    return mq.TLO.Spell(key)[memberName]()
-end
-
---- Grab the MQ datatype name of a member by handing the *unevaluated* proxy to
---- mq.gettype. This evaluates the member again, so it can throw just like the
---- value read can -- caller pcalls it.
-local function readMemberType(key, memberName)
-    return mq.gettype(mq.TLO.Spell(key)[memberName])
-end
-
---- Read a slot-indexed member such as Attrib(slot).
-local function readSlotValue(key, memberName, slot)
-    return mq.TLO.Spell(key)[memberName](slot)()
 end
 
 --- True when the slot holds no effect: SPA_NOSPELL, or the SPA_CHA filler with a base of 0.
@@ -264,10 +202,9 @@ end
 ---@param spa integer
 ---@return boolean
 local function isEmptySlot(key, slot, spa)
-    if spa == SPA_NOSPELL then return true end
-    if spa ~= SPA_CHA then return false end
-    local okBase, base = pcall(readSlotValue, key, 'Base', slot)
-    return okBase and base == 0
+    if spa == _SPAs.EQSPA.SPA_NOSPELL then return true end
+    if spa ~= _SPAs.EQSPA.SPA_CHA then return false end
+    return mq.TLO.Spell(key).Base(slot)() == 0
 end
 
 --- Read every non-empty effect slot on the spell: its SPA plus Base/Base2/Max/Calc.
@@ -275,16 +212,15 @@ end
 ---@return SpellEffectSlot[]
 local function readSpellEffects(key)
     local effects = {}
-    local okCount, numEffects = pcall(readMemberValue, key, 'NumEffects')
-    if not okCount or type(numEffects) ~= 'number' then return effects end
+    local numEffects = mq.TLO.Spell(key).NumEffects()
+    if type(numEffects) ~= 'number' then return effects end
 
     for slot = 1, numEffects do
-        local okSpa, spa = pcall(readSlotValue, key, 'Attrib', slot)
-        if okSpa and type(spa) == 'number' and not isEmptySlot(key, slot, spa) then
-            local effect = { slot = slot, spa = spa, spaName = _SPAs and _SPAs.SPAName(spa) or ('SPA ' .. spa), values = {} }
+        local spa = mq.TLO.Spell(key).Attrib(slot)()
+        if type(spa) == 'number' and not isEmptySlot(key, slot, spa) then
+            local effect = { slot = slot, spa = spa, spaName = _SPAs.SPAName(spa), values = {} }
             for _, memberName in ipairs(SLOT_VALUE_MEMBERS) do
-                local okValue, value = pcall(readSlotValue, key, memberName, slot)
-                effect.values[memberName] = okValue and (formatValue(value)) or '?'
+                effect.values[memberName] = formatValue(mq.TLO.Spell(key)[memberName](slot)())
             end
             effects[#effects + 1] = effect
         end
@@ -323,9 +259,9 @@ end
 ---@return string|nil
 local function memberType(memberName)
     local cached = typeByMember[memberName]
-    if cached or not hasGetType then return cached end
-    local okType, mqType = pcall(readMemberType, spellKey, memberName)
-    if okType and type(mqType) == 'string' and trim(mqType) ~= '' then
+    if cached then return cached end
+    local mqType = mq.gettype(mq.TLO.Spell(spellKey)[memberName])
+    if type(mqType) == 'string' and trim(mqType) ~= '' then
         typeByMember[memberName] = mqType
         return mqType
     end
@@ -351,7 +287,7 @@ local function buildRow(member, effects)
         return row
     end
 
-    local ok, value = pcall(readMemberValue, spellKey, member.name)
+    local ok, value = pcall(mq.TLO.Spell(spellKey)[member.name])
     if not ok then
         local msg = cleanError(value)
         row.state   = 'error'
@@ -417,7 +353,7 @@ local function buildSnapshot()
     lastRefresh = mq.gettime()
 
     local key = spellKey
-    if not key then
+    if key == 0 then
         rowsByIndex, rowsByName = {}, {}
         countRows()
         return
@@ -447,7 +383,7 @@ local function refreshSnapshot()
 
     lastRefresh = mq.gettime()
     local key = spellKey
-    if not key then return end
+    if key == 0 then return end
 
     local fresh = readRows(key, rowsByIndex)
     for i, row in ipairs(rowsByIndex) do
@@ -457,7 +393,7 @@ local function refreshSnapshot()
 end
 
 local function clearResults()
-    spellKey, spellName, spellID = nil, nil, nil
+    spellKey, spellName, spellID = 0, nil, nil
     rowsByIndex, rowsByName = {}, {}
     countOK, countNull, countErr = 0, 0, 0
 end
@@ -480,10 +416,9 @@ local function doLookup()
 
     spellKey = id
     spellID  = id
-    local okName, name = pcall(readSpellName, id)
-    spellName = (okName and name) or text
+    spellName = mq.TLO.Spell(id).Name() or text
 
-    statusText    = string.format('%s (ID %d)', tostring(spellName), tonumber(spellID) or 0)
+    statusText    = string.format('%s (ID %d)', spellName, spellID)
     statusIsError = false
     buildSnapshot()
 end
@@ -515,7 +450,6 @@ local function pushTextColor(c)
 end
 
 local function drawToolbar()
-    -- Spell input --------------------------------------------------------
     ImGui.SetNextItemWidth(260)
     local newInput, enterPressed = ImGui.InputText('Spell name or ID', spellInput, ImGuiInputTextFlags.EnterReturnsTrue)
     if newInput ~= spellInput then
@@ -539,7 +473,6 @@ local function drawToolbar()
         pendingRescan = true
     end
 
-    -- Status -------------------------------------------------------------
     pushTextColor(statusIsError and COLOR_BAD or COLOR_OK)
     ImGui.TextUnformatted(statusText)
     ImGui.PopStyleColor()
@@ -552,7 +485,6 @@ local function drawToolbar()
 
     ImGui.Separator()
 
-    -- Filter + options ---------------------------------------------------
     ImGui.SetNextItemWidth(200)
     memberFilter = ImGui.InputText('Filter members', memberFilter)
 
@@ -567,7 +499,6 @@ local function drawToolbar()
     ImGui.SameLine()
     autoRefresh = ImGui.Checkbox('Auto-refresh', autoRefresh)
 
-    -- Counts -------------------------------------------------------------
     pushTextColor(COLOR_HEADING)
     ImGui.TextUnformatted(string.format(
         '%d members | %d values | %d null | %d need a param / errored',
@@ -590,8 +521,6 @@ local function drawRow(row)
 
     ImGui.TableNextColumn()
     pushStateColor(row.state)
-    -- TextUnformatted, not Text: ImGui.Text treats arg 1 as a format string and
-    -- spell values (e.g. "Increase Hitpoints by 100%") contain % signs.
     if row.slotLines then
         local open = ImGui.TreeNode(row.display .. '###slots')
         if ImGui.IsItemHovered() then ImGui.SetTooltip('%s', row.tooltip) end
@@ -608,29 +537,24 @@ local function drawRow(row)
     ImGui.PopStyleColor()
 
     ImGui.TableNextColumn()
-    if hasClipboard then
-        if ImGui.SmallButton('copy') then
-            copyToClipboard(row.copy)
+    if ImGui.SmallButton('copy') then
+        copyToClipboard(row.copy)
+    end
+    if ImGui.IsItemHovered() then ImGui.SetTooltip('Copy this value (right-click for more)') end
+    if ImGui.BeginPopupContextItem('##copymenu') then
+        if ImGui.MenuItem('Copy value') then copyToClipboard(row.copy) end
+        if ImGui.MenuItem('Copy member name') then copyToClipboard(row.name) end
+        if ImGui.MenuItem('Copy name = value') then
+            copyToClipboard(string.format('%s = %s', row.name, row.copy))
         end
-        if ImGui.IsItemHovered() then ImGui.SetTooltip('Copy this value (right-click for more)') end
-        -- Right-click the copy button for the other copy flavors.
-        if ImGui.BeginPopupContextItem('##copymenu') then
-            if ImGui.MenuItem('Copy value') then copyToClipboard(row.copy) end
-            if ImGui.MenuItem('Copy member name') then copyToClipboard(row.name) end
-            if ImGui.MenuItem('Copy name = value') then
-                copyToClipboard(string.format('%s = %s', row.name, row.copy))
+        if ImGui.MenuItem('Copy TLO expression') then
+            if row.tloParam then
+                copyToClipboard(string.format('mq.TLO.Spell(%d).%s(%d)()', spellID, row.name, row.tloParam))
+            else
+                copyToClipboard(string.format('mq.TLO.Spell(%d).%s()', spellID, row.name))
             end
-            if ImGui.MenuItem('Copy TLO expression') then
-                if row.tloParam then
-                    copyToClipboard(string.format('mq.TLO.Spell(%d).%s(%d)()', spellID, row.name, row.tloParam))
-                else
-                    copyToClipboard(string.format('mq.TLO.Spell(%d).%s()', spellID, row.name))
-                end
-            end
-            ImGui.EndPopup()
         end
-    else
-        ImGui.TextDisabled('n/a')
+        ImGui.EndPopup()
     end
 
     ImGui.PopID()
@@ -673,14 +597,13 @@ local function drawGUI()
         drawToolbar()
         if #rowsByIndex > 0 then
             drawTable()
-        elseif spellKey then
+        elseif spellKey ~= 0 then
             ImGui.TextDisabled('No member data -- try Refresh values.')
         else
             ImGui.TextDisabled('No spell loaded.')
         end
     end
 
-    -- Begin/End are the odd pair: End() must be called regardless of the return.
     ImGui.End()
 end
 
@@ -694,7 +617,6 @@ mq.imgui.init(SCRIPT_NAME, drawGUI)
 printf('\ag[%s]\ax running -- close the window to stop the script.', SCRIPT_NAME)
 
 while openGUI do
-    -- All TLO work happens here, never in the draw callback.
     if pendingRescan then
         pendingRescan = false
         pendingRefresh = false
@@ -714,7 +636,7 @@ while openGUI do
     elseif pendingRefresh then
         pendingRefresh = false
         refreshSnapshot()
-    elseif autoRefresh and spellKey and (mq.gettime() - lastRefresh) >= AUTO_REFRESH_MS then
+    elseif autoRefresh and spellKey ~= 0 and (mq.gettime() - lastRefresh) >= AUTO_REFRESH_MS then
         refreshSnapshot()
     end
 
