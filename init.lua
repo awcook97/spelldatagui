@@ -52,6 +52,18 @@ local SPA_SLOT_MEMBERS   = { HasSPA = true, Attrib = true, Base = true, Base2 = 
 ---@field spaName string
 ---@field values table<string, string>
 
+---@class SpellMember
+---@field index integer
+---@field name string
+
+---@class SpellRow: SpellMember
+---@field state 'value'|'null'|'error'
+---@field vtype string
+---@field display string
+---@field copy string
+---@field tooltip string
+---@field slotLines string[]|nil
+
 -- Optional bindings -- guard so the script still runs on older MQ builds.
 local hasGetType   = type(mq.gettype) == 'function'
 local hasClipboard = type(ImGui.SetClipboardText) == 'function'
@@ -296,60 +308,97 @@ local function slotMemberLines(memberName, effects)
     return lines, summary
 end
 
+--- Read one member of the current spell into a fresh display row.
+---@param member SpellMember
+---@param effects SpellEffectSlot[]
+---@param knownType string|nil MQ type already resolved for this member; skips mq.gettype
+---@return SpellRow
+local function buildRow(member, effects, knownType)
+    local row = { index = member.index, name = member.name }
+
+    if SPA_SLOT_MEMBERS[member.name] and #effects > 0 then
+        local lines, summary = slotMemberLines(member.name, effects)
+        row.state     = 'value'
+        row.vtype     = member.name == 'HasSPA' and 'SPA list' or 'per slot'
+        row.slotLines = lines
+        row.copy      = table.concat(lines, '\n')
+        row.display   = truncate(table.concat(summary, ', '))
+        row.tooltip   = string.format('%s  [%s]\n\n%s', member.name, row.vtype, row.copy)
+        return row
+    end
+
+    local ok, value = pcall(readMemberValue, spellKey, member.name)
+    if not ok then
+        local msg = cleanError(value)
+        row.state   = 'error'
+        row.vtype   = '--'
+        row.display = isParamError(msg) and '<requires param>' or ('<error> ' .. truncate(msg))
+        row.copy    = msg
+        row.tooltip = string.format('%s\n\n%s', member.name, msg)
+        return row
+    end
+
+    local text, luaType = formatValue(value)
+    row.state = (value == nil) and 'null' or 'value'
+    row.vtype = knownType or luaType
+
+    if not knownType and hasGetType then
+        local okType, mqType = pcall(readMemberType, spellKey, member.name)
+        if okType and type(mqType) == 'string' and trim(mqType) ~= '' then
+            row.vtype = mqType
+        end
+    end
+
+    row.copy    = text
+    row.display = truncate(text)
+    row.tooltip = string.format('%s  [%s]\n\n%s', member.name, row.vtype, text)
+    return row
+end
+
+--- Copy a freshly read row onto the displayed row, only when its value, state or type changed.
+---@param row SpellRow
+---@param fresh SpellRow
+local function applyRowChanges(row, fresh)
+    if row.copy == fresh.copy and row.state == fresh.state and row.vtype == fresh.vtype then return end
+    row.state     = fresh.state
+    row.vtype     = fresh.vtype
+    row.display   = fresh.display
+    row.copy      = fresh.copy
+    row.tooltip   = fresh.tooltip
+    row.slotLines = fresh.slotLines
+end
+
+--- Recompute the value / null / error counts from the current rows.
+local function countRows()
+    countOK, countNull, countErr = 0, 0, 0
+    for _, row in ipairs(rowsByIndex) do
+        if row.state == 'error' then
+            countErr = countErr + 1
+        elseif row.state == 'null' then
+            countNull = countNull + 1
+        else
+            countOK = countOK + 1
+        end
+    end
+end
+
 local function buildSnapshot()
     rowsByIndex, rowsByName = {}, {}
-    countOK, countNull, countErr = 0, 0, 0
     lastRefresh = mq.gettime()
 
-    if not spellKey then return end
+    if not spellKey then
+        countRows()
+        return
+    end
 
     local effects = readSpellEffects(spellKey)
 
     for _, member in ipairs(membersByIndex) do
-        local row = { index = member.index, name = member.name }
-
-        if SPA_SLOT_MEMBERS[member.name] and #effects > 0 then
-            local lines, summary = slotMemberLines(member.name, effects)
-            row.state     = 'value'
-            row.vtype     = member.name == 'HasSPA' and 'SPA list' or 'per slot'
-            row.slotLines = lines
-            row.copy      = table.concat(lines, '\n')
-            row.display   = truncate(table.concat(summary, ', '))
-            row.tooltip   = string.format('%s  [%s]\n\n%s', member.name, row.vtype, row.copy)
-            countOK = countOK + 1
-        else
-            local ok, value = pcall(readMemberValue, spellKey, member.name)
-            if not ok then
-                local msg = cleanError(value)
-                row.state   = 'error'
-                row.vtype   = '--'
-                row.display = isParamError(msg) and '<requires param>' or ('<error> ' .. truncate(msg))
-                row.copy    = msg
-                row.tooltip = string.format('%s\n\n%s', member.name, msg)
-                countErr = countErr + 1
-            else
-                local text, luaType = formatValue(value)
-                row.state = (value == nil) and 'null' or 'value'
-                row.vtype = luaType
-
-                if hasGetType then
-                    local okType, mqType = pcall(readMemberType, spellKey, member.name)
-                    if okType and type(mqType) == 'string' and trim(mqType) ~= '' then
-                        row.vtype = mqType
-                    end
-                end
-
-                row.copy    = text
-                row.display = truncate(text)
-                row.tooltip = string.format('%s  [%s]\n\n%s', member.name, row.vtype, text)
-
-                if row.state == 'null' then countNull = countNull + 1 else countOK = countOK + 1 end
-            end
-        end
-
+        local row = buildRow(member, effects)
         rowsByIndex[#rowsByIndex + 1] = row
         rowsByName[#rowsByName + 1]   = row
     end
+    countRows()
 
     -- Same row tables, alternate ordering. Index is the stable tiebreak.
     table.sort(rowsByName, function(a, b)
@@ -357,6 +406,24 @@ local function buildSnapshot()
         if an == bn then return a.index < b.index end
         return an < bn
     end)
+end
+
+--- Re-read the current spell's values in place, updating only rows whose value changed.
+local function refreshSnapshot()
+    if #rowsByIndex == 0 then
+        buildSnapshot()
+        return
+    end
+
+    lastRefresh = mq.gettime()
+    if not spellKey then return end
+
+    local effects = readSpellEffects(spellKey)
+    for _, row in ipairs(rowsByIndex) do
+        local knownType = row.state ~= 'error' and row.vtype or nil
+        applyRowChanges(row, buildRow(row, effects, knownType))
+    end
+    countRows()
 end
 
 local function clearResults()
@@ -594,8 +661,9 @@ while openGUI do
     -- All TLO work happens here, never in the draw callback.
     if pendingRescan then
         pendingRescan = false
+        pendingRefresh = false
         scanMembers()
-        pendingRefresh = true
+        buildSnapshot()
     end
 
     if lookupDueAt and mq.gettime() >= lookupDueAt then
@@ -609,9 +677,9 @@ while openGUI do
         doLookup()
     elseif pendingRefresh then
         pendingRefresh = false
-        buildSnapshot()
+        refreshSnapshot()
     elseif autoRefresh and spellKey and (mq.gettime() - lastRefresh) >= AUTO_REFRESH_MS then
-        buildSnapshot()
+        refreshSnapshot()
     end
 
     mq.delay(100)
